@@ -9,6 +9,14 @@
 #include <queue>
 #include <vector>
 
+// 添加 FFmpeg 重采样相关头文件
+extern "C" {
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+}
+
 class AudioPlayer {
 public:
   // 播放器状态枚举
@@ -48,6 +56,9 @@ private:
   bool init(int sampleRate, int channels);
   void processDecodedFrame(AVFrame *frame);
 
+  // 音频格式转换
+  bool initResampler();
+
   SDL_AudioDeviceID audioDevice;
   std::unique_ptr<AudioDecoder> decoder;
   State playerState;
@@ -68,6 +79,21 @@ private:
   std::thread decodingThread;
   bool isDecodingThreadRunning;
   void decodingLoop();
+
+  // 音频格式转换
+  SwrContext *swrContext{nullptr};
+  SDL_AudioFormat deviceFormat;
+  int deviceChannels;
+  int deviceSampleRate;
+
+  // 增加更细致的缓冲区控制
+  static constexpr size_t MAX_AUDIO_BUFFER_SIZE = 8192; // 最大缓冲区大小
+  static constexpr size_t LOW_WATER_MARK = 10;          // 低水位标记
+
+  // 添加缓冲区状态监控
+  std::atomic<bool> underrun{false};    // 缓冲区不足标志
+  std::atomic<size_t> bufferedSize{0};  // 当前缓冲的总大小
+  void updateBufferSize(int64_t delta); // 添加新方法
 
   // 日志
   std::shared_ptr<spdlog::logger> _logger;

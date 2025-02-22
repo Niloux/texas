@@ -83,6 +83,7 @@ public:
   // 音频信息获取
   int getSampleRate() const;
   int getChannels() const;
+  uint64_t getChannelLayout() const;
   AVSampleFormat getSampleFormat() const;
   double getDuration() const;
   double getCurrentTimestamp() const;

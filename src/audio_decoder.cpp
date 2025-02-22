@@ -274,6 +274,14 @@ int AudioDecoder::getChannels() const {
   return codecContext->ch_layout.nb_channels;
 }
 
+// 获取通道布局
+uint64_t AudioDecoder::getChannelLayout() const {
+  if (!codecContext) {
+    return 0;
+  }
+  return codecContext->ch_layout.u.mask;
+}
+
 AVSampleFormat AudioDecoder::getSampleFormat() const {
   return codecContext ? codecContext->sample_fmt : AV_SAMPLE_FMT_NONE;
 }

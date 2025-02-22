@@ -1,5 +1,6 @@
 #include "audio_player.h"
 #include <algorithm>
+#include <numeric>
 
 AudioPlayer::AudioPlayer()
     : audioDevice(0), playerState(State::STOPPED), isPlaying(false),
@@ -26,6 +27,9 @@ AudioPlayer::~AudioPlayer() {
   if (audioDevice) {
     SDL_CloseAudioDevice(audioDevice);
   }
+  if (swrContext) {
+    swr_free(&swrContext);
+  }
   SDL_Quit();
 }
 
@@ -42,6 +46,12 @@ bool AudioPlayer::loadFile(const std::string &filename) {
   // 初始化音频设备
   if (!init(decoder->getSampleRate(), decoder->getChannels())) {
     _logger->error("无法初始化音频设备");
+    return false;
+  }
+
+  // 初始化重采样器
+  if (!initResampler()) {
+    _logger->error("无法初始化重采样器");
     return false;
   }
 
@@ -105,6 +115,12 @@ void AudioPlayer::stop() {
     // 停止解码器
     if (decoder) {
       decoder->stop();
+    }
+
+    // 清理重采样器
+    if (swrContext) {
+      swr_free(&swrContext);
+      swrContext = nullptr;
     }
 
     // 清空音频队列
@@ -180,37 +196,122 @@ void AudioPlayer::decodingLoop() {
 }
 
 void AudioPlayer::processDecodedFrame(AVFrame *frame) {
-  // 计算每个采样的字节数
-  int bytesPerSample = av_get_bytes_per_sample(decoder->getSampleFormat());
-  int channels = decoder->getChannels();
-  int totalBytes = frame->nb_samples * bytesPerSample * channels;
+  if (!frame) {
+    _logger->error("Null frame received");
+    return;
+  }
 
-  // 创建临时缓冲区
-  std::vector<uint8_t> buffer(totalBytes);
-  uint8_t *dst = buffer.data();
+  if (!swrContext) {
+    _logger->error("Resampler not initialized");
+    return;
+  }
 
-  // 平面音频格式需要特殊处理
-  if (av_sample_fmt_is_planar(decoder->getSampleFormat())) {
-    for (int sample = 0; sample < frame->nb_samples; sample++) {
-      for (int channel = 0; channel < channels; channel++) {
-        memcpy(dst, frame->data[channel] + sample * bytesPerSample,
-               bytesPerSample);
-        dst += bytesPerSample;
+  auto start = std::chrono::high_resolution_clock::now();
+
+  try {
+    // 计算输出样本数，考虑重采样延迟
+    int64_t delay = swr_get_delay(swrContext, frame->sample_rate);
+    int out_samples =
+        av_rescale_rnd(delay + frame->nb_samples, deviceSampleRate,
+                       frame->sample_rate, AV_ROUND_UP);
+
+    // 检查输出样本数是否合理
+    if (out_samples <= 0) {
+      _logger->error("Invalid output samples count: {}", out_samples);
+      return;
+    }
+
+    // 分配输出缓冲区，添加额外的安全空间
+    size_t bytesPerSample = sizeof(int16_t);
+    size_t bufferSize = out_samples * deviceChannels * bytesPerSample;
+    std::vector<uint8_t> buffer(bufferSize);
+
+    if (buffer.empty()) {
+      _logger->error("Failed to allocate buffer of size: {}", bufferSize);
+      return;
+    }
+
+    uint8_t *output_buffer[1] = {buffer.data()};
+
+    // 执行重采样
+    int samples_out =
+        swr_convert(swrContext, output_buffer, out_samples,
+                    (const uint8_t **)frame->extended_data, frame->nb_samples);
+
+    if (samples_out < 0) {
+      char errbuf[AV_ERROR_MAX_STRING_SIZE];
+      av_strerror(samples_out, errbuf, AV_ERROR_MAX_STRING_SIZE);
+      _logger->error("Resampling error: {}", errbuf);
+      return;
+    }
+
+    // 更新播放位置
+    if (frame->pts != AV_NOPTS_VALUE) {
+      AVRational timeBase = decoder->getTimeBase();
+      double newPosition = frame->pts * av_q2d(timeBase);
+
+      // 检测是否有大的时间跳变
+      if (std::abs(newPosition - currentPosition) > 0.1) { // 100ms以上的跳变
+        _logger->debug("Time jump detected: {} -> {}", currentPosition,
+                       newPosition);
+      }
+
+      currentPosition = newPosition;
+    }
+
+    // 计算实际输出的字节数
+    size_t actualBufferSize = samples_out * deviceChannels * bytesPerSample;
+
+    // 性能监控
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    if (duration.count() > 1000) { // 超过1ms的处理时间
+      _logger->warn("Frame processing took {} us, samples: {}, size: {} bytes",
+                    duration.count(), samples_out, actualBufferSize);
+    }
+
+    // 监控重采样比率
+    float resampleRatio = static_cast<float>(samples_out) / frame->nb_samples;
+    if (std::abs(resampleRatio - 1.0f) > 0.1f) { // 重采样比率偏差超过10%
+      _logger->debug("High resample ratio: {:.2f}, in: {}, out: {}",
+                     resampleRatio, frame->nb_samples, samples_out);
+    }
+
+    // 将处理后的数据推入播放队列
+    std::unique_lock<std::mutex> lock(queueMutex);
+
+    // 检查队列大小
+    if (audioQueue.size() >= MAX_QUEUE_SIZE) {
+      _logger->warn("Queue full, waiting for space...");
+      dataCondition.wait(lock, [this] {
+        return audioQueue.size() < MAX_QUEUE_SIZE || !isDecodingThreadRunning;
+      });
+
+      if (!isDecodingThreadRunning) {
+        _logger->debug("Decoding thread stopped while waiting");
+        return;
       }
     }
-  } else {
-    memcpy(buffer.data(), frame->data[0], totalBytes);
-  }
 
-  // 更新当前播放位置
-  if (frame->pts != AV_NOPTS_VALUE) {
-    AVRational timeBase = decoder->getTimeBase();
-    currentPosition = frame->pts * av_q2d(timeBase);
-  }
+    // 创建新的数据块并移动数据
+    std::vector<uint8_t> data;
+    data.reserve(actualBufferSize); // 预分配内存避免复制
+    data.assign(buffer.data(), buffer.data() + actualBufferSize);
 
-  // 将处理后的数据推入播放队列
-  if (!pushAudioData(buffer.data(), buffer.size())) {
-    _logger->error("Failed to push audio data to queue");
+    audioQueue.push(std::move(data));
+    updateBufferSize(actualBufferSize);
+
+    // 如果队列之前接近空，记录恢复事件
+    if (audioQueue.size() <= LOW_WATER_MARK) {
+      _logger->debug("Buffer recovering: {} frames in queue",
+                     audioQueue.size());
+    }
+
+  } catch (const std::exception &e) {
+    _logger->error("Exception in processDecodedFrame: {}", e.what());
+  } catch (...) {
+    _logger->error("Unknown exception in processDecodedFrame");
   }
 }
 
@@ -236,6 +337,11 @@ bool AudioPlayer::init(int sampleRate, int channels) {
     return false;
   }
 
+  // 保存实际获得的音频参数
+  deviceFormat = obtained_spec.format;
+  deviceChannels = obtained_spec.channels;
+  deviceSampleRate = obtained_spec.freq;
+
   return true;
 }
 
@@ -249,44 +355,55 @@ void AudioPlayer::audioCallback(void *userdata, Uint8 *stream, int len) {
 
 // 填充SDL音频缓冲区
 void AudioPlayer::fillAudioBuffer(Uint8 *stream, int len) {
-  // 清空音频缓冲区
   SDL_memset(stream, 0, len);
-
-  // 如果暂停中，直接返回（会播放静音）
-  if (isPaused) {
-    return;
-  }
 
   std::unique_lock<std::mutex> lock(queueMutex);
 
-  while (len > 0 && !audioQueue.empty()) {
-    // 获取队列中的第一个音频数据块
-    std::vector<uint8_t> &data = audioQueue.front();
+  if (audioQueue.empty()) {
+    underrun = true;
+    _logger->warn("Audio buffer underrun detected");
+    return;
+  }
 
-    // 计算本次要拷贝的数据长度
+  size_t totalCopied = 0;
+  while (len > 0 && !audioQueue.empty()) {
+    std::vector<uint8_t> &data = audioQueue.front();
     int copyLen = std::min(len, static_cast<int>(data.size()));
 
-    // 将数据混合到输出流中，使用设定的音量级别
-    SDL_MixAudioFormat(stream, data.data(), AUDIO_S16SYS, copyLen, volume);
+    if (underrun && totalCopied == 0) {
+      for (int i = 0; i < copyLen; i++) {
+        float fade = static_cast<float>(i) / copyLen;
+        stream[i] = static_cast<Uint8>(data[i] * fade);
+      }
+    } else {
+      SDL_MixAudioFormat(stream, data.data(), AUDIO_S16SYS, copyLen, volume);
+    }
 
     if (copyLen < data.size()) {
-      // 如果数据块没有完全使用，保留剩余部分
       data.erase(data.begin(), data.begin() + copyLen);
+      updateBufferSize(-copyLen);
     } else {
-      // 数据块已完全使用，从队列中移除
+      updateBufferSize(-data.size());
       audioQueue.pop();
     }
 
-    // 更新剩余需要填充的长度
     stream += copyLen;
     len -= copyLen;
+    totalCopied += copyLen;
   }
 
-  // 如果队列为空，通知可能在等待的生产者
-  if (audioQueue.empty()) {
+  if (audioQueue.size() < LOW_WATER_MARK) {
     lock.unlock();
     dataCondition.notify_one();
   }
+
+  underrun = false;
+}
+
+void AudioPlayer::updateBufferSize(int64_t delta) {
+  size_t current = bufferedSize.load();
+  while (!bufferedSize.compare_exchange_weak(current, current + delta))
+    ; // 空循环直到成功
 }
 
 // 将解码后的音频数据推入播放队列
@@ -313,5 +430,71 @@ bool AudioPlayer::pushAudioData(const uint8_t *data, int size) {
   std::vector<uint8_t> buffer(data, data + size);
   audioQueue.push(std::move(buffer));
 
+  return true;
+}
+
+bool AudioPlayer::initResampler() {
+  if (!decoder) {
+    _logger->error("Decoder is not initialized");
+    return false;
+  }
+
+  if (swrContext) {
+    swr_free(&swrContext);
+  }
+
+  // 创建重采样上下文
+  swrContext = swr_alloc();
+  if (!swrContext) {
+    _logger->error("Could not allocate resampler context");
+    return false;
+  }
+
+  // 获取输入通道数和采样格式
+  int in_channels = decoder->getChannels();
+  int in_sample_rate = decoder->getSampleRate();
+  AVSampleFormat in_sample_fmt = decoder->getSampleFormat();
+
+  // 创建输入和输出通道布局
+  AVChannelLayout in_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+  AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+
+  if (in_channels == 1) {
+    in_ch_layout = AV_CHANNEL_LAYOUT_MONO;
+  }
+
+  _logger->debug("Initializing resampler:");
+  _logger->debug("Input: channels={}, rate={}, format={}", in_channels,
+                 in_sample_rate, av_get_sample_fmt_name(in_sample_fmt));
+
+  // 设置输入参数 - 注意这里修改了调用方式
+  int ret = swr_alloc_set_opts2(&swrContext,
+                                &out_ch_layout,    // 输出通道布局
+                                AV_SAMPLE_FMT_S16, // 输出采样格式
+                                deviceSampleRate,  // 输出采样率
+                                &in_ch_layout,     // 输入通道布局
+                                in_sample_fmt,     // 输入采样格式
+                                in_sample_rate,    // 输入采样率
+                                0,                 // 日志偏移
+                                nullptr            // 日志上下文
+  );
+
+  if (ret < 0) {
+    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+    _logger->error("Could not allocate resampler context: {}", errbuf);
+    return false;
+  }
+
+  // 初始化重采样器
+  ret = swr_init(swrContext);
+  if (ret < 0) {
+    char errbuf[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+    _logger->error("Failed to initialize resampler: {}", errbuf);
+    return false;
+  }
+
+  _logger->info("Resampler initialized successfully");
   return true;
 }
