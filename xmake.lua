@@ -1,16 +1,22 @@
 add_rules("mode.debug", "mode.release")
 
+set_languages("c++17")
+
 -- 添加spdlog包
 add_requires("spdlog", {system=false})
 -- 添加ffmpeg包
 add_requires("ffmpeg", {system=false})
+-- 添加sdl2包
+add_requires("libsdl2", {alias = "sdl2", system=false})
 
 target("texas")
     set_kind("binary")
+
     add_files("src/**.cpp")
     add_includedirs("include")
-    set_languages("c++17")
-    add_packages("spdlog", "ffmpeg")
+
+    add_packages("spdlog", "ffmpeg", "sdl2")
+
 
 --
 -- If you want to known more usage about xmake, please see https://xmake.io

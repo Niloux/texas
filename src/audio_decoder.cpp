@@ -10,13 +10,23 @@ std::string getErrorString(int error) {
 }
 } // namespace
 
-AudioDecoder::AudioDecoder(const AudioDecoderConfig &config) : config(config) {
+AudioDecoder::AudioDecoder(const AudioDecoderConfig &config)
+    : config(config), formatContext(nullptr), codecContext(nullptr),
+      isDecoding(false), currentPts(0.0) {
   _logger = Logger::getInstance().getLogger("AudioDecoder");
 }
 
 AudioDecoder::~AudioDecoder() {
   stop();
   cleanup();
+}
+
+void AudioDecoder::close() {
+  stop();
+  cleanup();
+  formatContext.reset();
+  codecContext.reset();
+  audioStreamIndex = -1;
 }
 
 void AudioDecoder::cleanup() {
@@ -280,4 +290,35 @@ double AudioDecoder::getDuration() const {
   }
 
   return formatContext->duration / (double)AV_TIME_BASE;
+}
+
+bool AudioDecoder::seek(double seconds) {
+  if (!formatContext || audioStreamIndex < 0)
+    return false;
+
+  AVStream *stream = formatContext->streams[audioStreamIndex];
+  int64_t timestamp = seconds / av_q2d(stream->time_base);
+
+  // 执行seek操作
+  int ret = av_seek_frame(formatContext.get(), audioStreamIndex, timestamp,
+                          AVSEEK_FLAG_BACKWARD);
+  if (ret < 0) {
+    _logger->error("Seek失败: {}", getErrorString(ret));
+    return false;
+  }
+
+  // 刷新解码器缓冲
+  avcodec_flush_buffers(codecContext.get());
+  currentPts = seconds;
+
+  return true;
+}
+
+double AudioDecoder::getCurrentTimestamp() const { return currentPts; }
+
+AVRational AudioDecoder::getTimeBase() const {
+  if (!formatContext || audioStreamIndex < 0) {
+    return AVRational{0, 1};
+  }
+  return formatContext->streams[audioStreamIndex]->time_base;
 }
