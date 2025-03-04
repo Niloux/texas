@@ -14,8 +14,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/time.h>
 }
-
-#include "logger.h"
+#include <spdlog/logger.h>
 
 // 自定义删除器，用于智能指针管理
 struct FormatContextDeleter {

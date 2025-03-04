@@ -1,4 +1,5 @@
 #include "audio_decoder.h"
+#include "logger.h"
 
 namespace {
 constexpr int ERROR_BUFFER_SIZE = 1024;
