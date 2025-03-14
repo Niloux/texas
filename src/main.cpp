@@ -57,7 +57,7 @@ int main()
     Logger::LoggerConfig lconfig;
     lconfig.filename = "logs/app.log";
     lconfig.level = Logger::Level::DEBUG;
-    lconfig.console_output = true;
+    lconfig.console_output = false;
 
     // 初始化日志系统
     auto &logger = Logger::getInstance();
